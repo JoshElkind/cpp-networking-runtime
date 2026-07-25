@@ -3,6 +3,8 @@
 #include <atomic>
 #include <cstddef>
 #include <memory>
+#include <deque>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -71,9 +73,34 @@ class SpscQueue {
   const std::size_t cap_;
   const std::size_t mask_;
   std::unique_ptr<Slot[]> buf_;
-  // TODO: pad these, head/tail probably share a cache line
-  std::atomic<std::size_t> head_{0};
-  std::atomic<std::size_t> tail_{0};
+  alignas(64) std::atomic<std::size_t> head_{0};
+  alignas(64) std::atomic<std::size_t> tail_{0};
+};
+
+template <typename T>
+class MutexQueue {
+ public:
+  explicit MutexQueue(std::size_t capacity) : cap_(capacity) {}
+
+  bool try_push(T v) {
+    std::lock_guard<std::mutex> g(mu_);
+    if (q_.size() >= cap_) return false;
+    q_.push_back(std::move(v));
+    return true;
+  }
+
+  bool try_pop(T& out) {
+    std::lock_guard<std::mutex> g(mu_);
+    if (q_.empty()) return false;
+    out = std::move(q_.front());
+    q_.pop_front();
+    return true;
+  }
+
+ private:
+  std::size_t cap_;
+  std::mutex mu_;
+  std::deque<T> q_;
 };
 
 }  // namespace nmr
