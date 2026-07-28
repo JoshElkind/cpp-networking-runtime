@@ -23,6 +23,8 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 
 add_library(nmr STATIC
   src/memory_pool.cpp
+  src/poller.cpp
+  src/protocol.cpp
 )
 target_include_directories(nmr PUBLIC ${CMAKE_SOURCE_DIR}/include)
 find_package(Threads REQUIRED)
@@ -32,6 +34,7 @@ add_executable(nmr-tests
   tests/test_main.cpp
   tests/test_pool.cpp
   tests/test_queue.cpp
+  tests/test_protocol.cpp
 )
 target_include_directories(nmr-tests PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_link_libraries(nmr-tests PRIVATE nmr)
