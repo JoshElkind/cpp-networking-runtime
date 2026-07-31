@@ -25,10 +25,18 @@ add_library(nmr STATIC
   src/memory_pool.cpp
   src/poller.cpp
   src/protocol.cpp
+  src/broker.cpp
+  src/server.cpp
 )
 target_include_directories(nmr PUBLIC ${CMAKE_SOURCE_DIR}/include)
 find_package(Threads REQUIRED)
 target_link_libraries(nmr PUBLIC Threads::Threads)
+
+add_executable(nmr-broker src/main.cpp)
+target_link_libraries(nmr-broker PRIVATE nmr)
+
+add_executable(nmr-loadgen src/loadgen.cpp)
+target_link_libraries(nmr-loadgen PRIVATE nmr)
 
 add_executable(nmr-tests
   tests/test_main.cpp
@@ -38,6 +46,13 @@ add_executable(nmr-tests
 )
 target_include_directories(nmr-tests PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_link_libraries(nmr-tests PRIVATE nmr)
+
+add_executable(nmr-bench
+  bench/bench_queues.cpp
+  bench/bench_pool.cpp
+  bench/bench_e2e.cpp
+)
+target_link_libraries(nmr-bench PRIVATE nmr)
 
 enable_testing()
 add_test(NAME nmr-tests COMMAND nmr-tests)
