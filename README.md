@@ -66,6 +66,11 @@ cmake --build build-asan -j
 
 Linux is the intended production I/O path (`epoll`). macOS is supported via `kqueue` so the same tree builds on a laptop.
 
-## Numbers
+## Measured (this machine, Release, loopback)
 
-TODO
+- Lock-free SPSC: **163 Mops/s** vs mutex queue **40 Mops/s** (~4×)
+- Slab pool alloc/free: **94 Mops/s** vs `new`/`delete` **69 Mops/s**
+- End-to-end throughput: **~740k msgs/s** (4 publishers, 2 subscribers, 64B payload)
+- End-to-end latency: **p50 43 μs / p99 60 μs** (1–1, 64B, 20 μs pacing)
+
+Re-run `./build/nmr-bench` before quoting numbers on another host.

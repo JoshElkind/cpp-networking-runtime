@@ -1,96 +1,147 @@
 #pragma once
 
+#include "nmr/config.hpp"
+
+#include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstddef>
-#include <memory>
 #include <deque>
+#include <memory>
 #include <mutex>
+#include <new>
+#include <type_traits>
 #include <utility>
-#include <vector>
 
 namespace nmr {
 
-// Bounded lock-free SPSC ring. Capacity must be a power of two.
+// Bounded single-producer / single-consumer ring.
+//
+// Indices grow monotonically and are masked on access, so full vs. empty is
+// just head - tail == capacity vs. head == tail, with no wasted slot.
+//
+// Each side keeps a private copy of the other side's index and only re-reads
+// the shared one when the ring looks full (producer) or empty (consumer). In
+// steady state a push touches only the producer's cache line and the slot, and
+// a pop touches only the consumer's line and the slot.
 template <typename T>
 class SpscQueue {
+  static_assert(std::is_nothrow_move_constructible_v<T>);
+  static_assert(std::is_nothrow_destructible_v<T>);
+
  public:
   explicit SpscQueue(std::size_t capacity)
-      : cap_(next_pow2(capacity)), mask_(cap_ - 1), buf_(new Slot[cap_]) {
-    for (std::size_t i = 0; i < cap_; ++i) {
-      buf_[i].seq.store(i, std::memory_order_relaxed);
+      : capacity_(std::bit_ceil(std::max<std::size_t>(capacity, 2))),
+        mask_(capacity_ - 1),
+        slots_(std::make_unique<Slot[]>(capacity_)) {}
+
+  ~SpscQueue() {
+    const std::size_t head = producer_.head.load(std::memory_order_relaxed);
+    for (std::size_t i = consumer_.tail.load(std::memory_order_relaxed); i != head; ++i) {
+      slot(i)->~T();
     }
   }
 
   SpscQueue(const SpscQueue&) = delete;
   SpscQueue& operator=(const SpscQueue&) = delete;
 
-  bool try_push(T v) {
-    const std::size_t pos = head_.load(std::memory_order_relaxed);
-    Slot& slot = buf_[pos & mask_];
-    const std::size_t seq = slot.seq.load(std::memory_order_acquire);
-    if (seq != pos) {
-      return false;
+  // Producer only.
+  template <typename... Args>
+  bool try_emplace(Args&&... args) noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
+    const std::size_t head = producer_.head.load(std::memory_order_relaxed);
+    if (head - producer_.cached_tail == capacity_) {
+      producer_.cached_tail = consumer_.tail.load(std::memory_order_acquire);
+      if (head - producer_.cached_tail == capacity_) return false;
     }
-    slot.val = std::move(v);
-    slot.seq.store(pos + 1, std::memory_order_release);
-    head_.store(pos + 1, std::memory_order_relaxed);
+    ::new (static_cast<void*>(slot(head))) T(std::forward<Args>(args)...);
+    producer_.head.store(head + 1, std::memory_order_release);
     return true;
   }
 
-  bool try_pop(T& out) {
-    const std::size_t pos = tail_.load(std::memory_order_relaxed);
-    Slot& slot = buf_[pos & mask_];
-    const std::size_t seq = slot.seq.load(std::memory_order_acquire);
-    if (seq != pos + 1) {
-      return false;
+  bool try_push(T&& v) noexcept { return try_emplace(std::move(v)); }
+  bool try_push(const T& v) noexcept(std::is_nothrow_copy_constructible_v<T>) {
+    return try_emplace(v);
+  }
+
+  // Consumer only. Returns the oldest element without removing it, or nullptr
+  // if the ring is empty. The pointer stays valid until pop().
+  T* front() noexcept {
+    const std::size_t tail = consumer_.tail.load(std::memory_order_relaxed);
+    if (tail == consumer_.cached_head) {
+      consumer_.cached_head = producer_.head.load(std::memory_order_acquire);
+      if (tail == consumer_.cached_head) return nullptr;
     }
-    out = std::move(slot.val);
-    slot.seq.store(pos + cap_, std::memory_order_release);
-    tail_.store(pos + 1, std::memory_order_relaxed);
+    return slot(tail);
+  }
+
+  // Consumer only. Precondition: front() returned non-null.
+  void pop() noexcept {
+    const std::size_t tail = consumer_.tail.load(std::memory_order_relaxed);
+    slot(tail)->~T();
+    consumer_.tail.store(tail + 1, std::memory_order_release);
+  }
+
+  bool try_pop(T& out) noexcept(std::is_nothrow_move_assignable_v<T>) {
+    T* p = front();
+    if (p == nullptr) return false;
+    out = std::move(*p);
+    pop();
     return true;
   }
 
-  std::size_t capacity() const { return cap_; }
+  std::size_t capacity() const noexcept { return capacity_; }
 
-  std::size_t approx_size() const {
-    const auto h = head_.load(std::memory_order_acquire);
-    const auto t = tail_.load(std::memory_order_acquire);
-    return h - t;
+  // Safe from either side, but stale the moment it returns. Tail is loaded
+  // first so the difference can't go negative.
+  std::size_t size_approx() const noexcept {
+    const std::size_t tail = consumer_.tail.load(std::memory_order_acquire);
+    const std::size_t head = producer_.head.load(std::memory_order_acquire);
+    return head - tail;
   }
+
+  bool empty_approx() const noexcept { return size_approx() == 0; }
 
  private:
   struct Slot {
-    alignas(64) std::atomic<std::size_t> seq;
-    T val{};
+    alignas(T) std::byte storage[sizeof(T)];
   };
 
-  static std::size_t next_pow2(std::size_t n) {
-    std::size_t p = 1;
-    while (p < n) p <<= 1;
-    return p;
+  struct alignas(kCacheLine) ProducerSide {
+    std::atomic<std::size_t> head{0};
+    std::size_t cached_tail = 0;
+  };
+
+  struct alignas(kCacheLine) ConsumerSide {
+    std::atomic<std::size_t> tail{0};
+    std::size_t cached_head = 0;
+  };
+
+  T* slot(std::size_t i) const noexcept {
+    return std::launder(reinterpret_cast<T*>(slots_[i & mask_].storage));
   }
 
-  const std::size_t cap_;
+  const std::size_t capacity_;
   const std::size_t mask_;
-  std::unique_ptr<Slot[]> buf_;
-  alignas(64) std::atomic<std::size_t> head_{0};
-  alignas(64) std::atomic<std::size_t> tail_{0};
+  const std::unique_ptr<Slot[]> slots_;
+  ProducerSide producer_;
+  ConsumerSide consumer_;
 };
 
+// Baseline for the benchmarks: the obvious mutex + deque queue.
 template <typename T>
 class MutexQueue {
  public:
-  explicit MutexQueue(std::size_t capacity) : cap_(capacity) {}
+  explicit MutexQueue(std::size_t capacity) : capacity_(capacity) {}
 
   bool try_push(T v) {
-    std::lock_guard<std::mutex> g(mu_);
-    if (q_.size() >= cap_) return false;
+    std::lock_guard<std::mutex> lock(mu_);
+    if (q_.size() >= capacity_) return false;
     q_.push_back(std::move(v));
     return true;
   }
 
   bool try_pop(T& out) {
-    std::lock_guard<std::mutex> g(mu_);
+    std::lock_guard<std::mutex> lock(mu_);
     if (q_.empty()) return false;
     out = std::move(q_.front());
     q_.pop_front();
@@ -98,7 +149,7 @@ class MutexQueue {
   }
 
  private:
-  std::size_t cap_;
+  const std::size_t capacity_;
   std::mutex mu_;
   std::deque<T> q_;
 };

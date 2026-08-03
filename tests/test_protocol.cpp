@@ -1,4 +1,4 @@
-#include "test_macros.hpp"
+#include "test.hpp"
 
 #include "nmr/protocol.hpp"
 

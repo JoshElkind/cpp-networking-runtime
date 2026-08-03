@@ -4,7 +4,6 @@
 
 #include <cerrno>
 #include <chrono>
-#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 
@@ -177,7 +176,6 @@ void Server::accept_one() {
     }
     set_nonblock(fd);
     set_nodelay(fd);
-    std::fprintf(stderr, "accept fd=%d\n", fd);
     auto c = std::make_unique<Connection>(fd);
     Connection* raw = c.get();
     conns_.emplace(fd, std::move(c));

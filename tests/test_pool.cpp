@@ -1,4 +1,4 @@
-#include "test_macros.hpp"
+#include "test.hpp"
 
 #include "nmr/memory_pool.hpp"
 

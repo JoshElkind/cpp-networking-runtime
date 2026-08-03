@@ -41,7 +41,7 @@ target_link_libraries(nmr-loadgen PRIVATE nmr)
 add_executable(nmr-tests
   tests/test_main.cpp
   tests/test_pool.cpp
-  tests/test_queue.cpp
+  tests/test_spsc_queue.cpp
   tests/test_protocol.cpp
 )
 target_include_directories(nmr-tests PRIVATE ${CMAKE_SOURCE_DIR}/tests)
