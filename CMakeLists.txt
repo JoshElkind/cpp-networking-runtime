@@ -43,6 +43,7 @@ add_executable(nmr-tests
   tests/test_pool.cpp
   tests/test_spsc_queue.cpp
   tests/test_protocol.cpp
+  tests/test_histogram.cpp
 )
 target_include_directories(nmr-tests PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_link_libraries(nmr-tests PRIVATE nmr)
