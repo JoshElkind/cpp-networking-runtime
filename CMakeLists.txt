@@ -24,6 +24,8 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 add_library(nmr STATIC
   src/memory_pool.cpp
   src/poller.cpp
+  src/socket.cpp
+  src/cpu.cpp
   src/protocol.cpp
   src/broker.cpp
   src/server.cpp
