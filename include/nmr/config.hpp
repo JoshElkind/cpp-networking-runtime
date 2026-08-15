@@ -14,10 +14,8 @@ inline constexpr std::size_t kCacheLine = 128;
 inline constexpr std::size_t kCacheLine = 64;
 #endif
 
-inline constexpr std::uint32_t kMagic = 0x4E4D5254; // 'NMRT'
-inline constexpr std::size_t kMaxFrame = 1u << 20;
-inline constexpr std::size_t kDefaultPoolBlock = 4096;
-inline constexpr std::size_t kWriteHighWatermark = 1u << 20;
-inline constexpr std::size_t kWriteLowWatermark = 256u << 10;
+inline constexpr std::uint32_t kMagic = 0x4E4D5254;
+inline constexpr std::size_t kMaxTopicLen = 255;
+inline constexpr std::size_t kMaxPayloadLen = 1u << 20;
 
 }  // namespace nmr

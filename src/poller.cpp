@@ -1,147 +1,163 @@
 #include "nmr/poller.hpp"
 
+#include "nmr/socket.hpp"
+
 #include <cerrno>
-#include <stdexcept>
-#include <string>
-#include <vector>
+#include <system_error>
 
 #include <fcntl.h>
 #include <unistd.h>
 
-#ifdef __linux__
-#include <sys/epoll.h>
-#else
-#include <sys/event.h>
+#if defined(__linux__)
+#include <sys/eventfd.h>
 #endif
-
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
 
 namespace nmr {
+namespace {
 
-Poller::Poller() {
-#ifdef __linux__
-  fd_ = ::epoll_create1(0);
-#else
-  fd_ = ::kqueue();
-#endif
-  if (fd_ < 0) throw std::runtime_error("failed to create poller");
+[[noreturn]] void throw_errno(const char* what) {
+  throw std::system_error(errno, std::generic_category(), what);
 }
 
-Poller::~Poller() {
-  if (fd_ >= 0) ::close(fd_);
+}  // namespace
+
+#if defined(__linux__)
+
+Poller::Poller(int max_events)
+    : fd_(::epoll_create1(EPOLL_CLOEXEC)),
+      raw_(static_cast<std::size_t>(max_events)),
+      events_(static_cast<std::size_t>(max_events)) {
+  if (fd_ < 0) throw_errno("epoll_create1");
 }
 
-void Poller::add(int fd, void* data, bool want_read, bool want_write) {
-#ifdef __linux__
+Poller::~Poller() { ::close(fd_); }
+
+void Poller::add(int fd, std::uint64_t token, bool want_write) {
   epoll_event ev{};
-  ev.events = EPOLLET;
-  if (want_read) ev.events |= EPOLLIN;
+  ev.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
   if (want_write) ev.events |= EPOLLOUT;
-  ev.data.ptr = data;
-  if (::epoll_ctl(fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
-    throw std::runtime_error("epoll_ctl add failed");
-  }
-#else
-  struct kevent ke[2];
-  int n = 0;
-  if (want_read) {
-    EV_SET(&ke[n++], fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, data);
-  }
-  if (want_write) {
-    EV_SET(&ke[n++], fd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, data);
-  }
-  if (n && ::kevent(fd_, ke, n, nullptr, 0, nullptr) < 0) {
-    throw std::runtime_error("kevent add failed");
-  }
-#endif
+  ev.data.u64 = token;
+  if (::epoll_ctl(fd_, EPOLL_CTL_ADD, fd, &ev) < 0) throw_errno("epoll_ctl(ADD)");
 }
 
-void Poller::mod(int fd, void* data, bool want_read, bool want_write) {
-#ifdef __linux__
-  epoll_event ev{};
-  ev.events = EPOLLET;
-  if (want_read) ev.events |= EPOLLIN;
-  if (want_write) ev.events |= EPOLLOUT;
-  ev.data.ptr = data;
-  if (::epoll_ctl(fd_, EPOLL_CTL_MOD, fd, &ev) < 0) {
-    throw std::runtime_error("epoll_ctl mod failed");
-  }
-#else
-  struct kevent ke[4];
-  int n = 0;
-  EV_SET(&ke[n++], fd, EVFILT_READ, want_read ? (EV_ADD | EV_CLEAR) : EV_DELETE, 0, 0, data);
-  EV_SET(&ke[n++], fd, EVFILT_WRITE, want_write ? (EV_ADD | EV_CLEAR) : EV_DELETE, 0, 0, data);
-  ::kevent(fd_, ke, n, nullptr, 0, nullptr);
-  (void)fd;
-#endif
-}
+void Poller::remove(int fd) noexcept { ::epoll_ctl(fd_, EPOLL_CTL_DEL, fd, nullptr); }
 
-void Poller::del(int fd) {
-#ifdef __linux__
-  ::epoll_ctl(fd_, EPOLL_CTL_DEL, fd, nullptr);
-#else
-  struct kevent ke[2];
-  EV_SET(&ke[0], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
-  EV_SET(&ke[1], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
-  ::kevent(fd_, ke, 2, nullptr, 0, nullptr);
-#endif
-}
-
-int Poller::wait(PollEvent* out, int max_events, int timeout_ms) {
-#ifdef __linux__
-  std::vector<epoll_event> ev(static_cast<std::size_t>(max_events));
-  int n = ::epoll_wait(fd_, ev.data(), max_events, timeout_ms);
+std::span<const PollEvent> Poller::wait(int timeout_ms) {
+  const int n = ::epoll_wait(fd_, raw_.data(), static_cast<int>(raw_.size()), timeout_ms);
   if (n < 0) {
-    if (errno == EINTR) return 0;
-    throw std::runtime_error("epoll_wait failed");
+    if (errno == EINTR) return {};
+    throw_errno("epoll_wait");
   }
   for (int i = 0; i < n; ++i) {
-    out[i].data = ev[i].data.ptr;
-    out[i].readable = ev[i].events & (EPOLLIN | EPOLLRDHUP | EPOLLERR);
-    out[i].writable = ev[i].events & EPOLLOUT;
-    out[i].hangup = ev[i].events & (EPOLLHUP | EPOLLRDHUP | EPOLLERR);
+    const epoll_event& r = raw_[static_cast<std::size_t>(i)];
+    PollEvent& e = events_[static_cast<std::size_t>(i)];
+    e.token = r.data.u64;
+    e.readable = (r.events & (EPOLLIN | EPOLLRDHUP)) != 0;
+    e.writable = (r.events & EPOLLOUT) != 0;
+    e.closed = (r.events & (EPOLLHUP | EPOLLERR)) != 0;
   }
-  return n;
-#else
-  std::vector<struct kevent> ev(static_cast<std::size_t>(max_events));
-  timespec ts;
+  return {events_.data(), static_cast<std::size_t>(n)};
+}
+
+Waker::Waker() {
+  read_fd_ = write_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (read_fd_ < 0) throw_errno("eventfd");
+}
+
+Waker::~Waker() { ::close(read_fd_); }
+
+void Waker::wake() noexcept {
+  const std::uint64_t one = 1;
+  [[maybe_unused]] auto rc = ::write(write_fd_, &one, sizeof(one));
+}
+
+void Waker::drain() noexcept {
+  std::uint64_t v;
+  while (::read(read_fd_, &v, sizeof(v)) > 0) {
+  }
+}
+
+#else  // kqueue
+
+Poller::Poller(int max_events)
+    : fd_(::kqueue()),
+      raw_(static_cast<std::size_t>(max_events)),
+      events_(static_cast<std::size_t>(max_events)) {
+  if (fd_ < 0) throw_errno("kqueue");
+}
+
+Poller::~Poller() { ::close(fd_); }
+
+void Poller::add(int fd, std::uint64_t token, bool want_write) {
+  struct kevent changes[2];
+  void* udata = reinterpret_cast<void*>(static_cast<std::uintptr_t>(token));
+  EV_SET(&changes[0], fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, udata);
+  EV_SET(&changes[1], fd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, udata);
+  if (::kevent(fd_, changes, want_write ? 2 : 1, nullptr, 0, nullptr) < 0) {
+    throw_errno("kevent(EV_ADD)");
+  }
+}
+
+void Poller::remove(int fd) noexcept {
+  // The write filter goes last because it may never have been added; kevent
+  // stops at the first failing change, and by then the read filter is gone.
+  struct kevent changes[2];
+  EV_SET(&changes[0], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+  EV_SET(&changes[1], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+  ::kevent(fd_, changes, 2, nullptr, 0, nullptr);
+}
+
+std::span<const PollEvent> Poller::wait(int timeout_ms) {
+  timespec ts{};
   timespec* tsp = nullptr;
   if (timeout_ms >= 0) {
     ts.tv_sec = timeout_ms / 1000;
-    ts.tv_nsec = (timeout_ms % 1000) * 1000000L;
+    ts.tv_nsec = static_cast<long>(timeout_ms % 1000) * 1'000'000L;
     tsp = &ts;
   }
-  int n = ::kevent(fd_, nullptr, 0, ev.data(), max_events, tsp);
+  const int n = ::kevent(fd_, nullptr, 0, raw_.data(), static_cast<int>(raw_.size()), tsp);
   if (n < 0) {
-    if (errno == EINTR) return 0;
-    throw std::runtime_error("kevent wait failed");
+    if (errno == EINTR) return {};
+    throw_errno("kevent");
   }
   for (int i = 0; i < n; ++i) {
-    out[i].data = ev[i].udata;
-    out[i].readable = ev[i].filter == EVFILT_READ;
-    out[i].writable = ev[i].filter == EVFILT_WRITE;
-    out[i].hangup = ev[i].flags & (EV_EOF | EV_ERROR);
+    const struct kevent& r = raw_[static_cast<std::size_t>(i)];
+    PollEvent& e = events_[static_cast<std::size_t>(i)];
+    e.token = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(r.udata));
+    e.readable = r.filter == EVFILT_READ;
+    e.writable = r.filter == EVFILT_WRITE;
+    e.closed = (r.flags & EV_ERROR) != 0 || (r.filter == EVFILT_WRITE && (r.flags & EV_EOF));
   }
-  return n;
+  return {events_.data(), static_cast<std::size_t>(n)};
+}
+
+Waker::Waker() {
+  int fds[2];
+  if (::pipe(fds) < 0) throw_errno("pipe");
+  read_fd_ = fds[0];
+  write_fd_ = fds[1];
+  for (int fd : fds) {
+    set_nonblocking(fd);
+    ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+  }
+}
+
+Waker::~Waker() {
+  ::close(read_fd_);
+  ::close(write_fd_);
+}
+
+void Waker::wake() noexcept {
+  const char b = 1;
+  [[maybe_unused]] auto rc = ::write(write_fd_, &b, 1);
+}
+
+void Waker::drain() noexcept {
+  char buf[64];
+  while (::read(read_fd_, buf, sizeof(buf)) > 0) {
+  }
+}
+
 #endif
-}
-
-int set_nonblock(int fd) {
-  int flags = ::fcntl(fd, F_GETFL, 0);
-  if (flags < 0) return -1;
-  return ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-int set_nodelay(int fd) {
-  int yes = 1;
-  return ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
-}
-
-int set_reuseaddr(int fd) {
-  int yes = 1;
-  return ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-}
 
 }  // namespace nmr

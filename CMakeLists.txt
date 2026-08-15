@@ -22,7 +22,7 @@ endif()
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
 add_library(nmr STATIC
-  src/memory_pool.cpp
+  src/frame_pool.cpp
   src/poller.cpp
   src/socket.cpp
   src/cpu.cpp
@@ -42,7 +42,7 @@ target_link_libraries(nmr-loadgen PRIVATE nmr)
 
 add_executable(nmr-tests
   tests/test_main.cpp
-  tests/test_pool.cpp
+  tests/test_frame_pool.cpp
   tests/test_spsc_queue.cpp
   tests/test_protocol.cpp
   tests/test_histogram.cpp
