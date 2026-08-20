@@ -1,289 +1,446 @@
 #include "nmr/server.hpp"
 
-#include "nmr/config.hpp"
+#include "nmr/cpu.hpp"
 
+#include <algorithm>
 #include <cerrno>
-#include <chrono>
 #include <cstring>
-#include <stdexcept>
+#include <string>
+#include <utility>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
 #include <sys/socket.h>
-#include <unistd.h>
 
 namespace nmr {
-namespace {
 
-std::uint64_t now_ns() {
-  return static_cast<std::uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now().time_since_epoch())
-          .count());
-}
-
-int listen_tcp(std::uint16_t port, std::uint16_t& bound) {
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) throw std::runtime_error("socket");
-  set_reuseaddr(fd);
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  addr.sin_port = htons(port);
-  if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-    ::close(fd);
-    throw std::runtime_error("bind");
+Server::Server(ServerConfig config) : config_(std::move(config)) {
+  if (config_.workers < 1) config_.workers = 1;
+  workers_.reserve(static_cast<std::size_t>(config_.workers));
+  for (int i = 0; i < config_.workers; ++i) {
+    workers_.push_back(
+        std::make_unique<Worker>(config_.ingress_capacity, config_.egress_capacity));
   }
-  socklen_t len = sizeof(addr);
-  if (::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0) {
-    bound = ntohs(addr.sin_port);
-  } else {
-    bound = port;
-  }
-  if (::listen(fd, 512) < 0) {
-    ::close(fd);
-    throw std::runtime_error("listen");
-  }
-  set_nonblock(fd);
-  return fd;
 }
-
-}  // namespace
-
-Connection::Connection(int fd) : fd_(fd) {
-  in_buf_.reserve(8192);
-  out_buf_.reserve(8192);
-}
-
-Connection::~Connection() {
-  if (fd_ >= 0) ::close(fd_);
-}
-
-bool Connection::backpressured() const {
-  std::lock_guard<std::mutex> g(out_mu_);
-  return write_bytes_ >= kWriteHighWatermark;
-}
-
-std::vector<Connection::Parsed> Connection::take_messages() {
-  auto out = std::move(parsed_);
-  parsed_.clear();
-  return out;
-}
-
-bool Connection::enqueue_out(std::vector<std::byte> frame) {
-  std::lock_guard<std::mutex> g(out_mu_);
-  if (write_bytes_ >= kWriteHighWatermark) return false;
-  out_buf_.insert(out_buf_.end(), frame.begin(), frame.end());
-  write_bytes_ += frame.size();
-  want_write_ = true;
-  return true;
-}
-
-bool Connection::flush_writes() {
-  std::lock_guard<std::mutex> g(out_mu_);
-  while (!out_buf_.empty()) {
-    ssize_t n = ::send(fd_, out_buf_.data(), out_buf_.size(),
-#ifdef MSG_NOSIGNAL
-                       MSG_NOSIGNAL
-#else
-                       0
-#endif
-    );
-    if (n < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
-      return false;
-    }
-    if (n == 0) return false;
-    out_buf_.erase(out_buf_.begin(), out_buf_.begin() + n);
-    write_bytes_ -= static_cast<std::size_t>(n);
-  }
-  want_write_ = false;
-  return true;
-}
-
-bool Connection::read_frames() {
-  std::byte tmp[4096];
-  for (;;) {
-    ssize_t n = ::recv(fd_, tmp, sizeof(tmp), 0);
-    if (n < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-      return false;
-    }
-    if (n == 0) return false;
-    in_buf_.insert(in_buf_.end(), tmp, tmp + n);
-  }
-
-  while (true) {
-    std::span<const std::byte> view(in_buf_.data() + in_off_, in_buf_.size() - in_off_);
-    FrameHeader hdr{};
-    std::string_view topic;
-    std::span<const std::byte> payload;
-    std::size_t used = decode_frame(view, hdr, topic, payload);
-    if (used == static_cast<std::size_t>(-1)) return false;
-    if (used == 0) break;
-    Parsed p;
-    p.type = hdr.type;
-    p.topic.assign(topic.data(), topic.size());
-    p.payload.assign(payload.begin(), payload.end());
-    parsed_.push_back(std::move(p));
-    in_off_ += used;
-  }
-  if (in_off_ > 0) {
-    in_buf_.erase(in_buf_.begin(), in_buf_.begin() + static_cast<std::ptrdiff_t>(in_off_));
-    in_off_ = 0;
-  }
-  return true;
-}
-
-Server::Server(std::uint16_t port, int workers)
-    : port_(port), workers_n_(workers < 1 ? 1 : workers), broker_(workers_n_) {}
 
 Server::~Server() { stop(); }
 
 void Server::start() {
-  if (running_.exchange(true)) return;
-  listen_fd_ = listen_tcp(port_, bound_port_);
-  poller_.add(listen_fd_, nullptr, true, false);
-  io_ = std::thread([this] { io_loop(); });
-  workers_.reserve(static_cast<std::size_t>(workers_n_));
-  for (int i = 0; i < workers_n_; ++i) {
-    workers_.emplace_back([this, i] { worker_loop(i); });
+  if (started_) return;
+  listener_ = listen_tcp(config_.bind_address, config_.port);
+  port_ = local_port(listener_.get());
+  poller_.add(listener_.get(), kListenToken, /*want_write=*/false);
+  poller_.add(waker_.fd(), kWakeToken, /*want_write=*/false);
+
+  started_ = true;
+  workers_running_.store(true, std::memory_order_release);
+  io_running_.store(true, std::memory_order_release);
+  for (std::size_t i = 0; i < workers_.size(); ++i) {
+    workers_[i]->thread = std::thread([this, i] { worker_loop(i); });
   }
+  io_thread_ = std::thread([this] { io_loop(); });
 }
 
 void Server::stop() {
-  if (!running_.exchange(false)) return;
-  if (io_.joinable()) io_.join();
-  for (auto& t : workers_) {
-    if (t.joinable()) t.join();
+  if (!started_) return;
+  started_ = false;
+
+  // Workers first, while the IO thread is still draining egress: a worker
+  // blocked on a full egress ring always gets to finish its current command,
+  // so every frame's release reaches the IO side.
+  workers_running_.store(false, std::memory_order_release);
+  for (auto& w : workers_) {
+    if (w->thread.joinable()) w->thread.join();
   }
-  workers_.clear();
+
+  io_running_.store(false, std::memory_order_release);
+  waker_.wake();
+  if (io_thread_.joinable()) io_thread_.join();
+
+  reclaim_after_stop();
+}
+
+void Server::reclaim_after_stop() {
+  // Every thread has been joined, so this thread now owns the pool.
+  while (egress_pending()) drain_egress();
+  for (auto& w : workers_) {
+    // Deliveries in egress don't own a reference; only releases do, and
+    // drain_egress() handled those. Unprocessed ingress still owns one each.
+    for (Ingress* in = w->ingress.front(); in != nullptr; in = w->ingress.front()) {
+      if (in->frame != nullptr) pool_.release(in->frame);
+      w->ingress.pop();
+    }
+    for (const Ingress& in : w->backlog) {
+      if (in.frame != nullptr) pool_.release(in.frame);
+    }
+    w->backlog.clear();
+  }
+  for (auto& [id, conn] : conns_) {
+    poller_.remove(conn->fd());
+    conn->discard_output(pool_);
+  }
   conns_.clear();
-  if (listen_fd_ >= 0) {
-    ::close(listen_fd_);
-    listen_fd_ = -1;
+  dirty_.clear();
+  read_pending_.clear();
+  to_close_.clear();
+  if (listener_) {
+    poller_.remove(listener_.get());
+    listener_.reset();
   }
 }
 
-void Server::accept_one() {
-  for (;;) {
-    sockaddr_in addr{};
-    socklen_t len = sizeof(addr);
-    int fd = ::accept(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
-    if (fd < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-      return;
-    }
-    set_nonblock(fd);
-    set_nodelay(fd);
-    auto c = std::make_unique<Connection>(fd);
-    Connection* raw = c.get();
-    conns_.emplace(fd, std::move(c));
-    poller_.add(fd, raw, true, false);
-  }
+ServerStats Server::stats() const noexcept {
+  ServerStats s;
+  s.connections_accepted = counters_.connections_accepted.get();
+  s.connections_closed = counters_.connections_closed.get();
+  s.frames_in = counters_.frames_in.get();
+  s.publishes = counters_.publishes.get();
+  s.deliveries = counters_.deliveries.get();
+  s.bytes_out = counters_.bytes_out.get();
+  s.ingress_drops = counters_.ingress_drops.get();
+  s.slow_consumer_drops = counters_.slow_consumer_drops.get();
+  s.slow_consumer_disconnects = counters_.slow_consumer_disconnects.get();
+  s.protocol_errors = counters_.protocol_errors.get();
+  return s;
 }
 
-void Server::close_conn(Connection* c) {
-  if (!c) return;
-  int fd = c->fd();
-  broker_.drop(c);
-  poller_.del(fd);
-  conns_.erase(fd);
-}
-
-void Server::on_read(Connection* c) {
-  if (!c->read_frames()) {
-    close_conn(c);
-    return;
-  }
-  auto msgs = c->take_messages();
-  for (auto& m : msgs) {
-    if (m.type == MsgType::Subscribe) {
-      broker_.subscribe(c, m.topic);
-    } else if (m.type == MsgType::Unsubscribe) {
-      broker_.unsubscribe(c, m.topic);
-    } else if (m.type == MsgType::Publish) {
-      messages_in_.fetch_add(1, std::memory_order_relaxed);
-      if (c->backpressured()) {
-        backpressure_.fetch_add(1, std::memory_order_relaxed);
-        continue;
-      }
-      PublishJob job;
-      job.topic = std::move(m.topic);
-      job.payload = std::move(m.payload);
-      job.enqueued_ns = now_ns();
-      broker_.enqueue_publish(std::move(job));
-    }
-  }
-}
-
-void Server::on_write(Connection* c) {
-  if (!c->flush_writes()) {
-    close_conn(c);
-    return;
-  }
-  poller_.mod(c->fd(), c, true, c->want_write());
-}
+// ---------------------------------------------------------------------------
+// IO thread
 
 void Server::io_loop() {
-  PollEvent ev[64];
-  while (running_.load(std::memory_order_relaxed)) {
-    int n = poller_.wait(ev, 64, 1);
-    for (int i = 0; i < n; ++i) {
-      if (ev[i].data == nullptr) {
-        if (ev[i].readable) accept_one();
-        continue;
-      }
-      auto* c = static_cast<Connection*>(ev[i].data);
-      if (conns_.find(c->fd()) == conns_.end()) continue;
-      if (ev[i].hangup && !ev[i].readable) {
-        close_conn(c);
-        continue;
-      }
-      if (ev[i].readable) on_read(c);
-      if (conns_.find(c->fd()) == conns_.end()) continue;
-      if (ev[i].writable) on_write(c);
+  set_current_thread_name("nmr-io");
+  if (config_.io_cpu >= 0) pin_current_thread(config_.io_cpu);
+
+  while (io_running_.load(std::memory_order_acquire)) {
+    int timeout = 0;
+    if (!config_.busy_poll) {
+      // Sleep handshake with notify_io(). Each side stores, fences, then
+      // loads the other side's variable, so at least one of them sees the
+      // other's store: either a worker sees io_sleeping_ and wakes us, or we
+      // see its egress entries here and poll without blocking.
+      io_sleeping_.store(true, std::memory_order_relaxed);
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      timeout = egress_pending() || !read_pending_.empty() ? 0 : kIdleWaitMs;
     }
-    // Opportunistic flush for connections that queued writes from workers.
-    for (auto& [fd, c] : conns_) {
-      if (c->want_write()) {
-        if (!c->flush_writes()) {
-          // defer close to avoid iterator invalidation; mark
-          c->mark_close();
-        } else if (c->want_write()) {
-          poller_.mod(fd, c.get(), true, true);
-        }
-      }
+
+    const auto events = poller_.wait(timeout);
+    io_sleeping_.store(false, std::memory_order_relaxed);
+
+    service_pending_reads();
+    for (const PollEvent& ev : events) dispatch(ev);
+    drain_backlogs();
+    drain_egress();
+    flush_dirty();
+    close_pending();
+  }
+}
+
+bool Server::egress_pending() const noexcept {
+  for (const auto& w : workers_) {
+    if (!w->egress.empty_approx()) return true;
+  }
+  return false;
+}
+
+void Server::dispatch(const PollEvent& ev) {
+  if (ev.token == kListenToken) {
+    accept_all();
+    return;
+  }
+  if (ev.token == kWakeToken) {
+    waker_.drain();
+    return;
+  }
+
+  const auto it = conns_.find(ev.token);
+  if (it == conns_.end()) return;
+  Connection& c = *it->second;
+  if (c.closing()) return;
+
+  if (ev.readable && !c.read_pending()) on_readable(c);
+  if (ev.closed) schedule_close(c);
+  if (ev.writable && !c.closing() && c.has_output()) mark_dirty(c);
+}
+
+void Server::accept_all() {
+  for (;;) {
+#if defined(__linux__)
+    const int fd = ::accept4(listener_.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+#else
+    const int fd = ::accept(listener_.get(), nullptr, nullptr);
+#endif
+    if (fd < 0) {
+      if (errno == EINTR || errno == ECONNABORTED) continue;
+      // EAGAIN: backlog drained. EMFILE/ENFILE: out of descriptors; the
+      // pending connections stay queued in the kernel until a slot frees up.
+      return;
     }
-    for (auto it = conns_.begin(); it != conns_.end();) {
-      if (it->second->closing()) {
-        int fd = it->first;
-        broker_.drop(it->second.get());
-        poller_.del(fd);
-        it = conns_.erase(it);
+
+    Fd owned(fd);
+    try {
+#if !defined(__linux__)
+      set_nonblocking(fd);
+#endif
+      set_nodelay(fd);
+      set_nosigpipe(fd);
+      const ConnId id = next_conn_id_++;
+      auto conn = std::make_unique<Connection>(id, std::move(owned));
+      poller_.add(conn->fd(), id);
+      conns_.emplace(id, std::move(conn));
+      counters_.connections_accepted.add();
+    } catch (const std::system_error&) {
+      // Peer reset before we finished setting the socket up; `owned` closes it.
+    }
+  }
+}
+
+void Server::on_readable(Connection& c) {
+  // Parsing after every recv keeps the input buffer bounded by one read plus
+  // one partial frame, however fast the peer sends.
+  std::size_t budget = kReadBudget;
+  while (budget > 0) {
+    std::size_t n = 0;
+    switch (c.read_some(n)) {
+      case IoStatus::kOk:
+        break;
+      case IoStatus::kWouldBlock:
+        return;
+      case IoStatus::kClosed:
+      case IoStatus::kError:
+        schedule_close(c);
+        return;
+    }
+    if (!process_input(c)) {
+      counters_.protocol_errors.add();
+      schedule_close(c);
+      return;
+    }
+    budget -= std::min(budget, n);
+  }
+  // Out of budget before EAGAIN. Edge-triggering won't report this socket
+  // again until new data arrives, so remember it ourselves; otherwise one
+  // firehose publisher would monopolise the loop and starve egress.
+  c.set_read_pending(true);
+  read_pending_.push_back(c.id());
+}
+
+void Server::service_pending_reads() {
+  read_scratch_.swap(read_pending_);
+  for (const ConnId id : read_scratch_) {
+    const auto it = conns_.find(id);
+    if (it == conns_.end()) continue;
+    Connection& c = *it->second;
+    c.set_read_pending(false);
+    if (!c.closing()) on_readable(c);
+  }
+  read_scratch_.clear();
+}
+
+bool Server::process_input(Connection& c) {
+  const auto input = c.pending_input();
+  std::size_t used = 0;
+  bool ok = true;
+  while (ok) {
+    FrameView frame;
+    const DecodeStatus st = decode_frame(input.subspan(used), frame);
+    if (st == DecodeStatus::kNeedMore) break;
+    if (st != DecodeStatus::kOk) {
+      ok = false;
+      break;
+    }
+    used += frame.wire.size();
+    counters_.frames_in.add();
+    ok = handle_frame(c, frame);
+  }
+  c.consume_input(used);
+  return ok;
+}
+
+bool Server::handle_frame(Connection& c, const FrameView& frame) {
+  switch (frame.header.type) {
+    case MsgType::kPublish:
+      if (frame.topic.empty()) return false;
+      route(Command::kPublish, c, frame);
+      return true;
+    case MsgType::kSubscribe:
+      if (frame.topic.empty()) return false;
+      route(Command::kSubscribe, c, frame);
+      return true;
+    case MsgType::kUnsubscribe:
+      if (frame.topic.empty()) return false;
+      route(Command::kUnsubscribe, c, frame);
+      return true;
+    case MsgType::kHeartbeat: {
+      // Echoed straight back from the IO thread. Because it never goes
+      // through a worker, a client that sends SUBSCRIBE then a heartbeat and
+      // gets the echo knows its SUBSCRIBE is already queued ahead of any
+      // PUBLISH the broker reads after that point.
+      Frame* f = pool_.allocate(frame.wire.size());
+      std::memcpy(f->data(), frame.wire.data(), frame.wire.size());
+      c.enqueue(f);
+      mark_dirty(c);
+      return true;
+    }
+  }
+  return false;
+}
+
+void Server::route(Command cmd, Connection& c, const FrameView& frame) {
+  Worker& w = *workers_[topic_shard(frame.topic, workers_.size())];
+  Frame* f = pool_.allocate(frame.wire.size());
+  std::memcpy(f->data(), frame.wire.data(), frame.wire.size());
+  const Ingress in{f, c.id(), cmd};
+
+  if (cmd != Command::kPublish) {
+    send_control(w, in);
+    return;
+  }
+  // TODO: what happens if ingress is full? drop or block?
+  if (w.backlog.empty() && w.ingress.try_push(in)) {
+    counters_.publishes.add();
+  } else {
+    pool_.release(f);
+    counters_.ingress_drops.add();
+  }
+}
+
+void Server::send_control(Worker& w, const Ingress& in) {
+  if (w.backlog.empty() && w.ingress.try_push(in)) return;
+  w.backlog.push_back(in);
+}
+
+void Server::drain_backlogs() {
+  for (auto& w : workers_) {
+    while (!w->backlog.empty() && w->ingress.try_push(w->backlog.front())) {
+      w->backlog.pop_front();
+    }
+  }
+}
+
+void Server::drain_egress() {
+  for (auto& w : workers_) {
+    // Bounded so one hot worker can't starve socket IO. Anything left over
+    // makes the next poll non-blocking.
+    for (std::size_t i = 0; i < kEgressBatch; ++i) {
+      const Egress* e = w->egress.front();
+      if (e == nullptr) break;
+      const Egress item = *e;
+      w->egress.pop();
+      if (item.conn == kNoConn) {
+        pool_.release(item.frame);
       } else {
-        ++it;
+        deliver(item.conn, item.frame);
       }
     }
   }
 }
 
-void Server::worker_loop(int id) {
-  PublishJob job;
-  while (running_.load(std::memory_order_relaxed)) {
-    if (!broker_.dequeue_publish(id, job)) {
-      std::this_thread::yield();
+void Server::deliver(ConnId id, Frame* f) {
+  const auto it = conns_.find(id);
+  if (it == conns_.end()) return;
+  Connection& c = *it->second;
+  if (c.closing()) return;
+
+  if (c.queued_bytes() + f->size > config_.write_high_watermark) {
+    if (config_.slow_consumer == SlowConsumerPolicy::kDisconnect) {
+      counters_.slow_consumer_disconnects.add();
+      schedule_close(c);
+    } else {
+      counters_.slow_consumer_drops.add();
+    }
+    return;
+  }
+
+  pool_.retain(f);
+  c.enqueue(f);
+  counters_.deliveries.add();
+  mark_dirty(c);
+}
+
+void Server::mark_dirty(Connection& c) {
+  if (c.dirty()) return;
+  c.set_dirty(true);
+  dirty_.push_back(&c);
+}
+
+void Server::flush_dirty() {
+  // Connections are only destroyed in close_pending(), after this, so the
+  // raw pointers in dirty_ are all still valid here.
+  for (Connection* c : dirty_) {
+    c->set_dirty(false);
+    if (c->closing()) continue;
+    std::size_t written = 0;
+    const IoStatus st = c->flush(pool_, written);
+    counters_.bytes_out.add(written);
+    // kWouldBlock is fine: the socket's write edge will fire once it drains.
+    if (st == IoStatus::kError) schedule_close(*c);
+  }
+  dirty_.clear();
+}
+
+void Server::schedule_close(Connection& c) {
+  if (c.closing()) return;
+  c.mark_closing();
+  to_close_.push_back(c.id());
+}
+
+void Server::close_pending() {
+  for (const ConnId id : to_close_) {
+    const auto it = conns_.find(id);
+    if (it == conns_.end()) continue;
+    Connection& c = *it->second;
+    poller_.remove(c.fd());
+    c.discard_output(pool_);
+    for (auto& w : workers_) send_control(*w, Ingress{nullptr, id, Command::kDisconnect});
+    conns_.erase(it);
+    counters_.connections_closed.add();
+  }
+  to_close_.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Workers
+
+void Server::worker_loop(std::size_t index) {
+  Worker& w = *workers_[index];
+  const std::string name = "nmr-worker-" + std::to_string(index);
+  set_current_thread_name(name.c_str());
+  if (config_.worker_cpu_base >= 0) {
+    pin_current_thread(config_.worker_cpu_base + static_cast<int>(index));
+  }
+
+  const auto emit = [&](const Egress& e) {
+    // If the IO thread is behind, wait for it rather than dropping: a lost
+    // release would leak the frame. The IO thread never blocks on a worker,
+    // so this always makes progress.
+    while (!w.egress.try_push(e)) {
+      notify_io();
+      cpu_relax();
+    }
+  };
+
+  Backoff backoff(config_.busy_poll);
+  while (workers_running_.load(std::memory_order_acquire)) {
+    std::size_t processed = 0;
+    for (const Ingress* in = w.ingress.front(); in != nullptr && processed < kWorkerBatch;
+         in = w.ingress.front()) {
+      w.shard.apply(*in, emit);
+      w.ingress.pop();
+      ++processed;
+    }
+    if (processed == 0) {
+      backoff.idle();
       continue;
     }
-    auto subs = broker_.subscribers(job.topic);
-    auto frame = encode_frame(MsgType::Publish, job.topic, job.payload);
-    for (Connection* c : subs) {
-      if (!c->enqueue_out(frame)) {
-        backpressure_.fetch_add(1, std::memory_order_relaxed);
-        continue;
-      }
-      messages_out_.fetch_add(1, std::memory_order_relaxed);
-    }
+    backoff.reset();
+    notify_io();
+  }
+}
+
+void Server::notify_io() noexcept {
+  // Pairs with the fence in io_loop(); see the comment there.
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  if (io_sleeping_.load(std::memory_order_relaxed) &&
+      io_sleeping_.exchange(false, std::memory_order_relaxed)) {
+    waker_.wake();
   }
 }
 

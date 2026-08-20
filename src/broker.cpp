@@ -1,66 +1,62 @@
 #include "nmr/broker.hpp"
-#include "nmr/config.hpp"
 
-#include <functional>
+#include <algorithm>
 
 namespace nmr {
+namespace {
 
-Broker::Broker(int workers, std::size_t queue_cap) : pool_(kDefaultPoolBlock) {
-  if (workers < 1) workers = 1;
-  queues_.reserve(static_cast<std::size_t>(workers));
-  for (int i = 0; i < workers; ++i) {
-    queues_.push_back(std::make_unique<SpscQueue<PublishJob>>(queue_cap));
-  }
-}
-
-std::size_t Broker::shard(const std::string& topic) const {
-  return std::hash<std::string>{}(topic) % queues_.size();
-}
-
-void Broker::subscribe(Connection* c, const std::string& topic) {
-  std::lock_guard<std::mutex> g(mu_);
-  topics_[topic].insert(c);
-}
-
-void Broker::unsubscribe(Connection* c, const std::string& topic) {
-  std::lock_guard<std::mutex> g(mu_);
-  auto it = topics_.find(topic);
-  if (it == topics_.end()) return;
-  it->second.erase(c);
-  if (it->second.empty()) topics_.erase(it);
-}
-
-void Broker::drop(Connection* c) {
-  std::lock_guard<std::mutex> g(mu_);
-  for (auto it = topics_.begin(); it != topics_.end();) {
-    it->second.erase(c);
-    if (it->second.empty()) {
-      it = topics_.erase(it);
-    } else {
-      ++it;
-    }
-  }
-}
-
-bool Broker::enqueue_publish(PublishJob job) {
-  const std::size_t i = shard(job.topic);
-  if (!queues_[i]->try_push(std::move(job))) {
-    dropped_.fetch_add(1, std::memory_order_relaxed);
-    return false;
-  }
-  enqueued_.fetch_add(1, std::memory_order_relaxed);
+// Order doesn't matter in either list, so erase is swap-and-pop.
+template <typename T, typename U>
+bool erase_unordered(std::vector<T>& v, const U& value) {
+  const auto it = std::find(v.begin(), v.end(), value);
+  if (it == v.end()) return false;
+  if (it != v.end() - 1) *it = std::move(v.back());
+  v.pop_back();
   return true;
 }
 
-bool Broker::dequeue_publish(int worker_id, PublishJob& job) {
-  return queues_[static_cast<std::size_t>(worker_id)]->try_pop(job);
+}  // namespace
+
+std::size_t TopicShard::subscriber_count(std::string_view topic) const {
+  const auto* subs = find(topic);
+  return subs == nullptr ? 0 : subs->size();
 }
 
-std::vector<Connection*> Broker::subscribers(const std::string& topic) {
-  std::lock_guard<std::mutex> g(mu_);
+const std::vector<ConnId>* TopicShard::find(std::string_view topic) const {
+  const auto it = topics_.find(topic);
+  return it == topics_.end() ? nullptr : &it->second;
+}
+
+void TopicShard::subscribe(std::string_view topic, ConnId conn) {
   auto it = topics_.find(topic);
-  if (it == topics_.end()) return {};
-  return {it->second.begin(), it->second.end()};
+  if (it == topics_.end()) it = topics_.emplace(std::string(topic), std::vector<ConnId>{}).first;
+  auto& subs = it->second;
+  if (std::find(subs.begin(), subs.end(), conn) != subs.end()) return;
+  subs.push_back(conn);
+  conn_topics_[conn].emplace_back(topic);
+}
+
+void TopicShard::unsubscribe(std::string_view topic, ConnId conn) {
+  const auto it = topics_.find(topic);
+  if (it == topics_.end() || !erase_unordered(it->second, conn)) return;
+  if (it->second.empty()) topics_.erase(it);
+
+  const auto ct = conn_topics_.find(conn);
+  if (ct == conn_topics_.end()) return;
+  erase_unordered(ct->second, topic);
+  if (ct->second.empty()) conn_topics_.erase(ct);
+}
+
+void TopicShard::disconnect(ConnId conn) {
+  const auto ct = conn_topics_.find(conn);
+  if (ct == conn_topics_.end()) return;
+  for (const std::string& topic : ct->second) {
+    const auto it = topics_.find(topic);
+    if (it == topics_.end()) continue;
+    erase_unordered(it->second, conn);
+    if (it->second.empty()) topics_.erase(it);
+  }
+  conn_topics_.erase(ct);
 }
 
 }  // namespace nmr
