@@ -210,6 +210,60 @@ TEST(server_large_payload_roundtrip) {
   CHECK_EQ(server.frames_in_flight(), 0u);
 }
 
+namespace {
+
+// A subscriber that never reads, flooded until the broker has to act.
+void flood_slow_consumer(nmr::Server& server, nmr::Client& slow) {
+  slow.set_receive_buffer(4096);
+  slow.subscribe("firehose");
+  REQUIRE(slow.ping(2s));
+
+  nmr::Client pub("127.0.0.1", server.port());
+  const std::vector<std::byte> payload(1024);
+  for (int i = 0; i < 20'000; ++i) pub.publish("firehose", payload);
+  REQUIRE(pub.ping(5s));
+}
+
+}  // namespace
+
+TEST(server_slow_consumer_drop_policy) {
+  auto cfg = test_config();
+  cfg.write_high_watermark = 64 * 1024;
+  nmr::Server server(cfg);
+  server.start();
+  nmr::Client slow("127.0.0.1", server.port());
+  flood_slow_consumer(server, slow);
+
+  REQUIRE(eventually([&] { return server.stats().slow_consumer_drops > 0; }));
+  CHECK_EQ(server.stats().slow_consumer_disconnects, 0u);
+
+  // Other clients still get service.
+  nmr::Client sub("127.0.0.1", server.port());
+  nmr::Client pub("127.0.0.1", server.port());
+  sub.subscribe("ok");
+  REQUIRE(sub.ping(2s));
+  pub.publish("ok", u64_payload(5));
+  CHECK(sub.receive(2s).has_value());
+
+  server.stop();
+  CHECK_EQ(server.frames_in_flight(), 0u);
+}
+
+TEST(server_slow_consumer_disconnect_policy) {
+  auto cfg = test_config();
+  cfg.write_high_watermark = 64 * 1024;
+  cfg.slow_consumer = nmr::SlowConsumerPolicy::kDisconnect;
+  nmr::Server server(cfg);
+  server.start();
+  nmr::Client slow("127.0.0.1", server.port());
+  flood_slow_consumer(server, slow);
+
+  REQUIRE(eventually([&] { return server.stats().slow_consumer_disconnects == 1; }));
+  REQUIRE(eventually([&] { return server.stats().connections_closed >= 1; }));
+  server.stop();
+  CHECK_EQ(server.frames_in_flight(), 0u);
+}
+
 TEST(server_stop_with_traffic_in_flight_frees_everything) {
   auto cfg = test_config();
   cfg.workers = 4;

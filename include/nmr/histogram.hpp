@@ -18,7 +18,6 @@ namespace nmr {
 // with no allocation, so it can sit on a hot path.
 class LatencyHistogram {
  public:
-  // TODO: make sub-bucket precision a template param?
   static constexpr unsigned kSubBucketBits = 6;
   static constexpr std::uint64_t kSubBuckets = std::uint64_t{1} << kSubBucketBits;
   static constexpr std::uint64_t kHalf = kSubBuckets / 2;

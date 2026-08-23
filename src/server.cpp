@@ -293,7 +293,9 @@ void Server::route(Command cmd, Connection& c, const FrameView& frame) {
     send_control(w, in);
     return;
   }
-  // TODO: what happens if ingress is full? drop or block?
+  // Publishes are droppable: if the worker is behind, shed load here rather
+  // than buffer without bound. Also drop while control commands are
+  // backlogged, so a publish can't overtake an earlier subscribe.
   if (w.backlog.empty() && w.ingress.try_push(in)) {
     counters_.publishes.add();
   } else {
@@ -389,6 +391,7 @@ void Server::close_pending() {
     Connection& c = *it->second;
     poller_.remove(c.fd());
     c.discard_output(pool_);
+    // Every worker may hold subscriptions for this connection.
     for (auto& w : workers_) send_control(*w, Ingress{nullptr, id, Command::kDisconnect});
     conns_.erase(it);
     counters_.connections_closed.add();
