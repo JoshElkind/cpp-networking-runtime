@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} / ${{ matrix.compiler }} / ${{ matrix.config }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, compiler: g++,     config: release }
+          - { os: ubuntu-24.04, compiler: clang++, config: release }
+          - { os: ubuntu-24.04, compiler: g++,     config: asan }
+          - { os: macos-latest, compiler: clang++, config: release }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          case "${{ matrix.config }}" in
+            release) flags="-DCMAKE_BUILD_TYPE=Release" ;;
+            asan)    flags="-DCMAKE_BUILD_TYPE=Debug -DNMR_SANITIZER=address" ;;
+          esac
+          cmake -S . -B build -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} -DNMR_WERROR=ON $flags
+
+      - name: Build
+        run: cmake --build build -j4
+
+      - name: Test
+        run: ./build/nmr-tests
+
+      - name: Smoke-test the binaries
+        if: matrix.config == 'release'
+        run: |
+          ./build/nmr-broker --port 9555 --workers 2 &
+          sleep 0.5
+          ./build/nmr-loadgen --port 9555 --pubs 2 --subs 2 --seconds 1 --rate 10000
+          kill -INT %1
+          wait
