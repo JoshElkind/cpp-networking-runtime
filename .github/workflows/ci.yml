@@ -15,7 +15,9 @@ jobs:
           - { os: ubuntu-24.04, compiler: g++,     config: release }
           - { os: ubuntu-24.04, compiler: clang++, config: release }
           - { os: ubuntu-24.04, compiler: g++,     config: asan }
+          - { os: ubuntu-24.04, compiler: clang++, config: tsan }
           - { os: macos-latest, compiler: clang++, config: release }
+          - { os: macos-latest, compiler: clang++, config: asan }
 
     steps:
       - uses: actions/checkout@v4
@@ -25,6 +27,7 @@ jobs:
           case "${{ matrix.config }}" in
             release) flags="-DCMAKE_BUILD_TYPE=Release" ;;
             asan)    flags="-DCMAKE_BUILD_TYPE=Debug -DNMR_SANITIZER=address" ;;
+            tsan)    flags="-DCMAKE_BUILD_TYPE=RelWithDebInfo -DNMR_SANITIZER=thread" ;;
           esac
           cmake -S . -B build -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} -DNMR_WERROR=ON $flags
 
@@ -32,7 +35,13 @@ jobs:
         run: cmake --build build -j4
 
       - name: Test
-        run: ./build/nmr-tests
+        run: |
+          # TSan's shadow memory needs ASLR off on newer Linux kernels.
+          if [ "${{ matrix.config }}" = tsan ]; then
+            setarch "$(uname -m)" -R ./build/nmr-tests
+          else
+            ./build/nmr-tests
+          fi
 
       - name: Smoke-test the binaries
         if: matrix.config == 'release'
